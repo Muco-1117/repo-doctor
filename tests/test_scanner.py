@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,28 @@ from repo_doctor import markdown, sarif, scan
 
 
 class ScannerTest(unittest.TestCase):
+    def test_checks_all_tokens_on_line_and_prunes_dependency_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = "sk-" + "9u3Q7m2V8x4K6p1N5r0T7y3W9q2L8s4"
+            placeholder = "sk-" + "example_key_replace_before_use"
+            (root / "settings.txt").write_text(placeholder + " " + key, encoding="utf-8")
+            (root / "node_modules").mkdir()
+            (root / "node_modules" / "ignored.txt").write_text(key, encoding="utf-8")
+            report = scan(root)
+            self.assertEqual(report["summary"]["high"], 1)
+            self.assertEqual(report["files_scanned"], 1)
+            completed = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "repo_doctor.py"), str(root), "--format", "json", "--fail-on-high"], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 1)
+            self.assertNotIn(key, completed.stdout + completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["summary"]["high"], 1)
+
+    def test_recommends_only_present_npm_scripts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text('{"scripts":{"build":"vite build"}}', encoding="utf-8")
+            self.assertEqual(scan(root)["suggested_commands"], ["npm install", "npm run build"])
+
     def test_detects_real_key_without_printing_value(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

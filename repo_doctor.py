@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 from collections import Counter
@@ -37,14 +38,17 @@ def looks_like_placeholder(value: str) -> bool:
 
 
 def iter_files(root: Path) -> Iterable[Path]:
-    for path in root.rglob("*"):
-        if not path.is_file() or any(part in SKIP_DIRS for part in path.relative_to(root).parts):
-            continue
-        try:
-            if path.stat().st_size <= MAX_FILE_BYTES:
-                yield path
-        except OSError:
-            continue
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(name for name in dirs if name not in SKIP_DIRS and not (Path(directory) / name).is_symlink())
+        for name in sorted(files):
+            path = Path(directory) / name
+            if path.is_symlink():
+                continue
+            try:
+                if path.is_file() and path.stat().st_size <= MAX_FILE_BYTES:
+                    yield path
+            except OSError:
+                continue
 
 
 def finding(root: Path, path: Path, rule: str, severity: str, message: str, line: int | None = None) -> dict[str, Any]:
@@ -67,24 +71,19 @@ def scan(root: str | Path) -> dict[str, Any]:
         if lower in {"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "pyproject.toml", "requirements.txt", "pom.xml", "go.mod", "cargo.toml", "cargo.lock"}:
             manifests.append(relative)
         if (lower.startswith(".env") and lower not in {".env.example", ".env.sample"}) or lower in {"credentials.json", "credentials.yml", "application-local.yml", "application-local.yaml", "application-local.properties"} or path.suffix.lower() in {".pem", ".key", ".p12", ".pfx"}:
-            findings.append(finding(root, path, "sensitive-file", "medium", "Sensitive configuration or key file is tracked"))
+            findings.append(finding(root, path, "sensitive-file", "medium", "Sensitive configuration or key file is present"))
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for number, line in enumerate(text.splitlines(), 1):
             for rule, pattern, severity, message in RULES:
-                match = pattern.search(line)
-                if not match:
-                    continue
-                if looks_like_placeholder(match.group(0)):
-                    continue
-                if rule == "generic-secret":
-                    value = match.group(2)
+                for match in pattern.finditer(line):
+                    value = match.group(2) if rule == "generic-secret" else match.group(0)
                     if looks_like_placeholder(value):
                         continue
-                    severity = "high" if entropy(value) >= 3.5 else severity
-                findings.append(finding(root, path, rule, severity, message, number))
+                    level = "high" if rule == "generic-secret" and entropy(value) >= 3.5 else severity
+                    findings.append(finding(root, path, rule, level, message, number))
     gitignore = root / ".gitignore"
     ignore_text = gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.exists() else ""
     hygiene = {
@@ -94,9 +93,19 @@ def scan(root: str | Path) -> dict[str, Any]:
     }
     manifests = sorted(set(manifests))
     commands = []
-    if (root / "package.json").exists(): commands.extend(["npm ci", "npm test", "npm run build"])
+    if (root / "package.json").exists():
+        try:
+            package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+            scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
+        except (ValueError, OSError):
+            scripts = {}
+        commands.append("npm ci" if (root / "package-lock.json").exists() else "npm install")
+        if "test" in scripts: commands.append("npm test")
+        if "build" in scripts: commands.append("npm run build")
     if (root / "pom.xml").exists(): commands.append("mvn -B verify")
     if (root / "pyproject.toml").exists() or (root / "requirements.txt").exists(): commands.append("python -m pytest")
+    if list((root / "tests").glob("test_*.py")):
+        commands.append("python -m unittest discover -s tests -v")
     counts = Counter(item["severity"] for item in findings)
     return {
         "root": str(root), "files_scanned": file_count, "manifests": manifests,
